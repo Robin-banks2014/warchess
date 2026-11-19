@@ -137,6 +137,40 @@
   .ranks { top: calc(var(--sq) * 0.36); bottom: calc(var(--sq) * 0.36); left: 0; width: calc(var(--sq) * 0.36); display: grid; grid-template-rows: repeat(8, 1fr); position: absolute; }
   .files .coord, .ranks .coord { position: static; }
 
+  /* Ability toasts */
+  .ability-toasts {
+    position: absolute; left: 50%; bottom: calc(var(--sq) * 0.7);
+    transform: translateX(-50%);
+    display: flex; flex-direction: column; align-items: center; gap: 6px;
+    z-index: 30; pointer-events: none; width: max-content; max-width: 90%;
+  }
+  .toast {
+    display: flex; align-items: center; gap: 8px;
+    background: rgba(38, 34, 28, 0.96); border: 1px solid var(--line);
+    border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 7px 12px; font-size: 13px; line-height: 1.3;
+    box-shadow: 0 12px 26px rgba(0,0,0,0.5);
+    opacity: 0; transform: translateY(8px); transition: opacity 260ms ease, transform 260ms ease;
+  }
+  .toast.show { opacity: 1; transform: translateY(0); }
+  .toast.b { border-left-color: #7f8ea3; }
+  .toast img { width: 22px; height: 22px; flex: none; }
+  .toast strong { color: var(--accent); font-weight: 600; }
+
+  /* Ability legend */
+  .abilities {
+    background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px 12px;
+  }
+  .abilities-head {
+    font-size: 11px; color: var(--muted); text-transform: uppercase;
+    letter-spacing: 0.08em; margin-bottom: 8px;
+  }
+  .ability-legend { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+  .ability-legend li { display: flex; align-items: center; gap: 8px; font-size: 12px; line-height: 1.3; color: var(--text); }
+  .ability-legend img { width: 18px; height: 18px; flex: none; }
+  .ability-legend strong { color: var(--accent); font-weight: 600; }
+
   /* Promotion */
   .promo {
     position: absolute; inset: 0; z-index: 20;
@@ -245,6 +279,7 @@
         <div class="promo-choices" id="promoChoices"></div>
       </div>
     </div>
+    <div class="ability-toasts" id="abilityToasts" aria-live="polite"></div>
   </div>
 
   <aside class="panel" aria-label="Game controls">
@@ -273,6 +308,12 @@
       <button class="btn" id="undoBtn">Undo</button>
       <button class="btn" id="flipBtn">Flip board</button>
       <button class="btn" id="soundBtn" aria-pressed="true">Sound: on</button>
+      <button class="btn" id="abilityBtn" aria-pressed="true">Abilities: on</button>
+    </div>
+
+    <div class="abilities" aria-label="Piece abilities">
+      <div class="abilities-head">Piece abilities · activate when a piece captures</div>
+      <ul id="abilityLegend" class="ability-legend"></ul>
     </div>
 
     <div class="row">
@@ -312,6 +353,7 @@ const boardEl = $("board");
 const FILES = "abcdefgh";
 const pieceSrc = (color, type) => `./pieces/${color}${type.toUpperCase()}.svg`;
 const NAMES = { p: "pawn", n: "knight", b: "bishop", r: "rook", q: "queen", k: "king" };
+const START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
 let game = new Chess();
 let orientation = "w";
@@ -325,6 +367,9 @@ let thinking = false;
 let soundOn = true;
 let searchToken = 0;
 let pendingPromotion = null;
+let abilitiesOn = true;
+let moveLog = [];
+let snapshots = [START_FEN];
 
 /* ---------- Sound: synthesized wooden clack ---------- */
 let audioCtx;
@@ -438,7 +483,7 @@ function renderSidebar() {
   $("thinkTop").classList.toggle("on", thinking && game.turn() === top);
   $("thinkBottom").classList.toggle("on", thinking && game.turn() === bottom);
 
-  const hist = game.history({ verbose: true });
+  const hist = moveLog;
   const taken = { w: [], b: [] };
   for (const m of hist) if (m.captured) taken[m.color].push(m.captured);
   const order = "qrbnp";
@@ -487,6 +532,87 @@ function renderSidebar() {
 function render(animations) {
   renderBoard(animations);
   renderSidebar();
+}
+
+/* ---------- Piece abilities (triggered whenever a piece captures) ---------- */
+const ABILITIES = {
+  p: { name: "Pawn", title: "Promotion surge", text: "Promotes to a knight after it captures." },
+  n: { name: "Knight", title: "Leap home", text: "Leaps back to a free home square after it captures." },
+  b: { name: "Bishop", title: "Benediction", text: "Turns your most advanced pawn into a bishop." },
+  r: { name: "Rook", title: "Rally", text: "Turns your most advanced pawn into a rook." },
+  q: { name: "Queen", title: "Coronation", text: "Crowns your most advanced pawn as a queen." },
+  k: { name: "King", title: "Inspire", text: "Turns your most advanced pawn into a knight." },
+};
+const HOME_SQUARES = { w: { n: ["b1", "g1"] }, b: { n: ["b8", "g8"] } };
+const PAWN_TO = { b: "b", r: "r", q: "q", k: "n" };
+
+function abilityPawn(color) {
+  const pawns = game.board().flat().filter((p) => p && p.color === color && p.type === "p");
+  if (!pawns.length) return null;
+  const rank = (sq) => Number(sq[1]);
+  pawns.sort((a, b) => (color === "w" ? rank(b.square) - rank(a.square) : rank(a.square) - rank(b.square)));
+  return pawns[0].square;
+}
+
+function abilityLegal(color) {
+  const king = kingSquare(color);
+  if (!king) return false;
+  return !game.isAttacked(king, color === "w" ? "b" : "w");
+}
+
+function triggerAbility(move) {
+  if (move.piece === "p" && move.promotion) return null;
+  const color = move.color;
+  const ability = ABILITIES[move.piece];
+  if (!ability) return null;
+
+  let undo, text;
+  if (move.piece === "p") {
+    game.remove(move.to);
+    game.put({ type: "n", color }, move.to);
+    undo = () => { game.remove(move.to); game.put({ type: "p", color }, move.to); };
+    text = `The pawn on ${move.to} becomes a knight.`;
+  } else if (move.piece === "n") {
+    const home = HOME_SQUARES[color].n.find((sq) => !game.get(sq));
+    if (!home) return null;
+    game.remove(move.to);
+    game.put({ type: "n", color }, home);
+    undo = () => { game.remove(home); game.put({ type: "n", color }, move.to); };
+    text = `The knight leaps home to ${home}.`;
+  } else {
+    const sq = abilityPawn(color);
+    if (!sq) return null;
+    const to = PAWN_TO[move.piece];
+    game.remove(sq);
+    game.put({ type: to, color }, sq);
+    undo = () => { game.remove(sq); game.put({ type: "p", color }, sq); };
+    text = `The pawn on ${sq} becomes a ${NAMES[to]}.`;
+  }
+
+  if (!abilityLegal(color)) { undo(); return null; }
+  return { piece: move.piece, color, title: ability.title, text };
+}
+
+function abilityToast(entry) {
+  const host = $("abilityToasts");
+  if (!host) return;
+  const el = document.createElement("div");
+  el.className = "toast " + entry.color;
+  el.innerHTML = `<img src="${pieceSrc(entry.color, entry.piece)}" alt="">` +
+    `<span><strong>${entry.title}</strong> — ${entry.text}</span>`;
+  host.appendChild(el);
+  requestAnimationFrame(() => el.classList.add("show"));
+  setTimeout(() => { el.classList.remove("show"); setTimeout(() => el.remove(), 300); }, 3200);
+}
+
+function renderAbilityLegend() {
+  const el = $("abilityLegend");
+  if (!el) return;
+  el.innerHTML = Object.entries(ABILITIES).map(([type, a]) => `
+    <li>
+      <img src="${pieceSrc("w", type)}" alt="">
+      <span><strong>${a.name}</strong> — ${a.title}. ${a.text}</span>
+    </li>`).join("");
 }
 
 /* ---------- Interaction ---------- */
@@ -590,6 +716,10 @@ function commitMove(input, animate) {
   lastMove = { from: move.from, to: move.to };
   select(null);
   playMoveSound(move);
+  const ability = abilitiesOn && move.captured ? triggerAbility(move) : null;
+  if (ability) abilityToast(ability);
+  moveLog.push(move);
+  snapshots.push(game.fen());
   render(animate ? animationsFor(move) : animationsFor(move).slice(1));
   maybeComputerMove();
 }
@@ -759,6 +889,8 @@ function newGame() {
   humanColor = side === "r" ? (Math.random() < 0.5 ? "w" : "b") : side;
   orientation = mode === "ai" ? humanColor : "w";
   lastMove = null;
+  moveLog = [];
+  snapshots = [START_FEN];
   select(null);
   renderCoords();
   render();
@@ -774,13 +906,19 @@ $("soundBtn").onclick = () => {
   $("soundBtn").textContent = `Sound: ${soundOn ? "on" : "off"}`;
   $("soundBtn").setAttribute("aria-pressed", String(soundOn));
 };
+$("abilityBtn").onclick = () => {
+  abilitiesOn = !abilitiesOn;
+  $("abilityBtn").textContent = `Abilities: ${abilitiesOn ? "on" : "off"}`;
+  $("abilityBtn").setAttribute("aria-pressed", String(abilitiesOn));
+};
 $("undoBtn").onclick = () => {
-  if (thinking) return;
-  game.undo();
-  if (mode === "ai" && game.turn() !== humanColor && game.history().length) game.undo();
-  if (mode === "ai" && game.turn() !== humanColor) { /* computer opened as white; replay */ }
-  const h = game.history({ verbose: true });
-  lastMove = h.length ? { from: h.at(-1).from, to: h.at(-1).to } : null;
+  if (thinking || !moveLog.length) return;
+  const pop = () => { moveLog.pop(); snapshots.pop(); };
+  pop();
+  const turnNow = () => snapshots[snapshots.length - 1].split(" ")[1];
+  if (mode === "ai" && moveLog.length && turnNow() !== humanColor) pop();
+  game = new Chess(snapshots[snapshots.length - 1]);
+  lastMove = moveLog.length ? { from: moveLog.at(-1).from, to: moveLog.at(-1).to } : null;
   select(null);
   render();
   maybeComputerMove();
@@ -788,6 +926,7 @@ $("undoBtn").onclick = () => {
 
 renderCoords();
 render();
+renderAbilityLegend();
 </script>
 </body>
 </html>
